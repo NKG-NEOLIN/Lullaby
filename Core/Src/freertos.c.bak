@@ -1,0 +1,595 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * File Name          : freertos.c
+  * Description        : Code for freertos applications
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2024 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "FreeRTOS.h"
+#include "task.h"
+#include "main.h"
+#include "cmsis_os.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "iImu.h"
+#include "MPU6050/mpu6050.h"
+#include "stdio.h"
+#include "iDrive_Config.h"
+#include "iPrint.h"
+#include <math.h>
+#include "firstOrderFilter.h"
+#include "Bgc32.h"
+#include "board.h"
+#include "iHMC5883.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+#define Kp 7.2f
+#define Ki 0.0f
+#define halfT 0.001f
+float q_0 = 1, q_1 = 0, q_2 = 0, q_3 = 0;
+float exInt = 0, eyInt = 0, ezInt = 0;
+float P,R, Y;
+float accelOneG=9.8065;
+#define magneto 0
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+IMU_DATA_STRUCT ImuData;
+IMU_TEMP_STRUCT ImuTemp;
+HMC5883_DATA_STRUCT HMC5883Data;
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+#define ACCEL_SCALE_FACTOR 0.00059854//0.00119708f  // (1/8192) * 9.8065  (8192 LSB = 1 G)
+#define GYRO_SCALE_FACTOR  0.00026646f  // (1/65.5) * pi/180   (65.5 LSB = 1 DPS)
+float dt500Hz=0;
+float accel_TC_Bias_Slope_x;
+float accel_TC_Bias_Slope_y;
+float accel_TC_Bias_Slope_z;
+float accel_TC_Bias_Intercept_x;
+float accel_TC_Bias_Intercept_y;
+float accel_TC_Bias_Intercept_z;
+float gyro_TC_Bias_Slope_r;
+float gyro_TC_Bias_Slope_p;
+float gyro_TC_Bias_Slope_y;
+float gyro_TC_Bias_Intercept_r;
+float gyro_TC_Bias_Intercept_p;
+float gyro_TC_Bias_Intercept_y;
+float accelTCBias[3] = { 0.0f, 0.0f, 0.0f };
+float gyroTCBias[3];
+float accel500Hz[3] = {0.0f, 0.0f, 0.0f};
+float gyro500Hz[3] = {0.0f, 0.0f, 0.0f};
+float gyroRTBias[3] = {0.0f, 0.0f, 0.0f};
+float evvgcCFAttitude500Hz[3] = {0.0f, 0.0f, 0.0f};
+float accAngleSmooth[3];
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+/* USER CODE BEGIN Variables */
+
+
+/* USER CODE END Variables */
+osThreadId GimbalCoreHandle;
+
+/* Private function prototypes -----------------------------------------------*/
+/* USER CODE BEGIN FunctionPrototypes */
+
+
+void MPU6050_Calibration()
+{
+    uint16_t sampleRate      = 100;
+    uint16_t numberOfSamples = 100;
+
+    float accelBias1[3]       = { 0.0f, 0.0f, 0.0f };
+    float gyroBias1[3]        = { 0.0f, 0.0f, 0.0f };
+    float mpu6050Temperature1 = 0.0f;
+
+    float accelBias2[3]       = { 0.0f, 0.0f, 0.0f };
+    float gyroBias2[3]        = { 0.0f, 0.0f, 0.0f };
+    float mpu6050Temperature2 = 0.0f;
+
+    uint16_t index;
+    //mpu6050Calibrating = true;
+
+    printf("\nMPU6050 Calibration:\n\r");
+
+    ///////////////////////////////////
+    // Get samples at temperature1
+    ///////////////////////////////////
+    IMU_STRUCT* pImu = GetImuStr_Addr();
+
+    printf("\nBegin 1st MPU6050 Measurements...\n");
+
+    for (index = 0; index < numberOfSamples; index++)
+    {
+    	pImu->GetData(&ImuData);
+    	float temp = Read_Temperature();
+
+        accelBias1[0]    += ImuData.accel_x;
+        accelBias1[1]    += ImuData.accel_y;
+        accelBias1[2]	 += (ImuData.accel_z -9.8065);
+        gyroBias1[0]     += ImuData.gyro_r;
+        gyroBias1[1]     += ImuData.gyro_p;
+        gyroBias1[2]     += ImuData.gyro_y;
+        mpu6050Temperature1  += temp;
+
+        printf("x=%f, y=%f, z=%f, accelBias1[0]=%f, accelBias1[1]=%f, accelBias1[2]=%f \r\n", ImuData.accel_x, ImuData.accel_y, ImuData.accel_z, accelBias1[0], accelBias1[1], accelBias1[2]);
+        osDelay(sampleRate);
+    }
+
+    accelBias1[0]   /= (float) numberOfSamples;
+    accelBias1[1]   /= (float) numberOfSamples;
+    accelBias1[2]   /= (float) numberOfSamples;
+    gyroBias1[0]    /= (float) numberOfSamples;
+    gyroBias1[1]    /= (float) numberOfSamples;
+    gyroBias1[2]    /= (float) numberOfSamples;
+    mpu6050Temperature1 /= (float) numberOfSamples;
+    printf("accelBias1[0]=%f, accelBias1[1]=%f, accelBias1[2]=%f \r\n",accelBias1[0],accelBias1[1],accelBias1[2]);
+    printf("mpu6050Temperature1=%f",mpu6050Temperature1);
+    printf("\n\nEnd 1st MPU6050 Measurements\n\r");
+
+    osDelay(10000);
+    ///////////////////////////////////
+    // Get samples at temperature2
+    ///////////////////////////////////
+    printf("\nBegin 2nd MPU6050 Measurements...\n\r");
+
+    for (index = 0; index < numberOfSamples; index++)
+    {
+    	pImu->GetData(&ImuData);
+    	float temp = Read_Temperature();
+        //rawAccel[ZAXIS].value = rawAccel[ZAXIS].value - 8192;
+//    	float accel_z = ImuData.accel_z-16384;
+
+        accelBias2[0]    += ImuData.accel_x;
+        accelBias2[1]    += ImuData.accel_y;
+        accelBias2[2]	 += (ImuData.accel_z -9.8065);
+        gyroBias2[0]     += ImuData.gyro_r;
+        gyroBias2[1]     += ImuData.gyro_p;
+        gyroBias2[2]     += ImuData.gyro_y;
+        mpu6050Temperature2  += temp;
+        printf("x=%f, y=%f, z=%f, accelBias1[0]=%f, accelBias1[1]=%f, accelBias1[2]=%f \r\n", ImuData.accel_x, ImuData.accel_y, ImuData.accel_z, accelBias2[0], accelBias2[1], accelBias2[2]);
+        osDelay(sampleRate);
+    }
+
+    accelBias2[0]   /= (float) numberOfSamples;
+    accelBias2[1]   /= (float) numberOfSamples;
+    accelBias2[2]   /= (float) numberOfSamples;
+    gyroBias2[0]    /= (float) numberOfSamples;
+    gyroBias2[1]    /= (float) numberOfSamples;
+    gyroBias2[2]    /= (float) numberOfSamples;
+    mpu6050Temperature2 /= (float) numberOfSamples;
+    printf("accelBias2[0]=%f, accelBias2[1]=%f, accelBias2[2]=%f \r\n",accelBias2[0],accelBias2[1],accelBias2[2]);
+    printf("mpu6050Temperature2=%f",mpu6050Temperature2);
+    printf("\n\nEnd 2nd MPU6050 Measurements\n\r");
+
+//    pCalibrationImu->CalibrationData(&ImuCalData);
+	accel_TC_Bias_Slope_x = (accelBias2[0] - accelBias1[0]) / (mpu6050Temperature2 - mpu6050Temperature1);
+	accel_TC_Bias_Slope_y = (accelBias2[1] - accelBias1[1]) / (mpu6050Temperature2 - mpu6050Temperature1);
+	accel_TC_Bias_Slope_z = (accelBias2[2] - accelBias1[2]) / (mpu6050Temperature2 - mpu6050Temperature1);
+
+	printf("accel_TC_Bias_Slope_x=%f, accel_TC_Bias_Slope_y=%f, accel_TC_Bias_Slope_z=%f \r\n", accel_TC_Bias_Slope_x, accel_TC_Bias_Slope_y, accel_TC_Bias_Slope_z);
+
+	accel_TC_Bias_Intercept_x = accelBias2[0] - (accel_TC_Bias_Slope_x * mpu6050Temperature2);
+	accel_TC_Bias_Intercept_y = accelBias2[1] - (accel_TC_Bias_Slope_y * mpu6050Temperature2);
+	accel_TC_Bias_Intercept_z = accelBias2[2] - (accel_TC_Bias_Slope_z * mpu6050Temperature2);
+
+	gyro_TC_Bias_Slope_r = (gyroBias2[0] - gyroBias1[0]) / (mpu6050Temperature2 - mpu6050Temperature1);
+	gyro_TC_Bias_Slope_p = (gyroBias2[1] - gyroBias1[1]) / (mpu6050Temperature2 - mpu6050Temperature1);
+	gyro_TC_Bias_Slope_y = (gyroBias2[2] - gyroBias1[2]) / (mpu6050Temperature2 - mpu6050Temperature1);
+
+	gyro_TC_Bias_Intercept_r = gyroBias2[0] - (gyro_TC_Bias_Slope_r * mpu6050Temperature2);
+	gyro_TC_Bias_Intercept_p = gyroBias2[1] - (gyro_TC_Bias_Slope_p * mpu6050Temperature2);
+	gyro_TC_Bias_Intercept_y = gyroBias2[2] - (gyro_TC_Bias_Slope_y * mpu6050Temperature2);
+    ///////////////////////////////////
+}
+
+void computeMPU6050TCBias()
+{
+	float Temperature = Read_Temperature();
+
+	accelTCBias[0] =  accel_TC_Bias_Slope_x * Temperature + accel_TC_Bias_Intercept_x;
+	accelTCBias[1] =  accel_TC_Bias_Slope_y * Temperature + accel_TC_Bias_Intercept_y;
+	accelTCBias[2] =  accel_TC_Bias_Slope_z * Temperature + accel_TC_Bias_Intercept_z;
+	gyroTCBias[0] = gyro_TC_Bias_Slope_r * Temperature + gyro_TC_Bias_Intercept_r;
+	gyroTCBias[1]= gyro_TC_Bias_Slope_p * Temperature + gyro_TC_Bias_Intercept_p;
+	gyroTCBias[2]= gyro_TC_Bias_Slope_y * Temperature + gyro_TC_Bias_Intercept_y;
+}
+void computeMPU6050RTData(void)
+{
+    uint8_t  axis;
+    uint16_t samples;
+
+    IMU_STRUCT* pImu = GetImuStr_Addr();
+
+    double accelSum[3]    = { 0.0f, 0.0f, 0.0f };
+    double gyroSum[3]     = { 0.0f, 0.0f, 0.0f };
+
+//    mpu6050Calibrating = true;
+
+//    for (samples = 0; samples < 5000; samples++)
+    for (samples = 0; samples < 1; samples++)
+    {
+        //readMPU6050();
+    	computeMPU6050TCBias();
+        pImu->GetData(&ImuData);
+
+        accelSum[0] += ImuData.accel_x - accelTCBias[0];
+        accelSum[1] += ImuData.accel_y - accelTCBias[1];
+        accelSum[2] += ImuData.accel_z - accelTCBias[2];
+
+        gyroSum[0]  += ImuData.gyro_r  - gyroTCBias[0];
+        gyroSum[1]  += ImuData.gyro_p  - gyroTCBias[1];
+        gyroSum[2]  += ImuData.gyro_y  - gyroTCBias[2];
+
+        //delayMicroseconds(500);
+        osDelay(1000);
+    }
+
+    for (axis = 0; axis < 3; axis++)
+    {
+			//(1/8192) * 9.8065
+    	//gyroSum[axis]   = accelSum[axis] / 50.0f * ACCEL_SCALE_FACTOR;
+    	gyroSum[axis]   = accelSum[axis] / 50.0f;
+
+
+        gyroRTBias[axis] = gyroSum[axis]  / 50.0f;
+    }
+    printf("gyroRTBias[0]=%f, gyroRTBias=%f, gyroRTBias[2]=%f, \r\n",gyroRTBias[0],gyroRTBias[1],gyroRTBias[2]);
+
+    accelOneG = sqrt(SQR(accelSum[XAXIS]) + SQR(accelSum[YAXIS]) + SQR(accelSum[ZAXIS]));
+
+//    mpu6050Calibrating = false;
+}
+void Angle_Update(float gx,float gy,float gz,float ax,float ay,float az)
+{
+    float norm;
+    float vx, vy, vz;
+    float ex, ey, ez;
+
+    norm = sqrt((ax*ax) + (ay*ay) + (az*az));
+    ax = accel500Hz[0] / norm;
+    ay = accel500Hz[1] / norm;
+    az = accel500Hz[2] / norm;
+
+    vx = 2*(q_1*q_3 - q_0*q_2);
+    vy = 2*(q_0*q_1 + q_2*q_3);
+    vz = q_0*q_0 - q_1*q_1 - q_2*q_2 + q_3*q_3;
+
+
+    ex = (ay*vz - az*vy);
+    ey = (az*vx - ax*vz);
+    ez = (ax*vy - ay*vx);
+
+    exInt = exInt + ex*Ki;
+    eyInt = eyInt + ey*Ki;
+    ezInt = ezInt + ez*Ki;
+
+    if(fabs(ex)<= 0.01)
+    exInt = 0;
+    if(fabs(ey)<= 0.01)
+    eyInt = 0;
+    if(fabs(ez)<= 0.01)
+    ezInt = 0;
+
+    gx = gx + Kp*ex + exInt;
+    gy = gy + Kp*ey + eyInt;
+    gz = gz + Kp*ez + ezInt;
+
+    q_0 = q_0 + (-q_1*gx - q_2*gy - q_3*gz)*halfT;
+    q_1 = q_1 + (q_0*gx + q_2*gz - q_3*gy)*halfT;
+    q_2 = q_2 + (q_0*gy - q_1*gz + q_3*gx)*halfT;
+    q_3 = q_3 + (q_0*gz + q_1*gy - q_2*gx)*halfT;
+
+    norm = sqrt(q_0*q_0 + q_1*q_1 + q_2*q_2 + q_3*q_3);
+    q_0 = q_0 / norm;
+    q_1 = q_1 / norm;
+    q_2 = q_2 / norm;
+    q_3 = q_3 / norm;
+
+    P  = asin(-2 * q_1 * q_3 + 2 * q_0* q_2)* 57.3; // pitch
+    R = atan2(2 * q_2 * q_3 + 2 * q_0 * q_1, -2 * q_1 * q_1 - 2 * q_2* q_2 + 1)* 57.3; // rollv
+//	        R = normalizeAngle180(R);
+    Y = atan2(2*(q_1*q_2 + q_0*q_3),q_0*q_0+q_1*q_1-q_2*q_2-q_3*q_3) * 57.3;
+
+    printf("Pitch = %f,", P);
+    printf("Roll= %f ,", R);
+    printf("Yaw= %f\r\n", Y);
+}
+void initOrientation()
+{
+    int initLoops = 150;
+    float accAngle[3] = { 0.0f, 0.0f, 0.0f };
+    int i;
+    IMU_STRUCT* pImu = GetImuStr_Addr();
+
+    for (i = 0; i < initLoops; i++)
+    {
+       // readMPU6050();//å¾MPU6050å¾—åˆ°?? é?Ÿåº¦??Œé??º???•¸??šï?Œä¸¦?²è?? ??‡å?å?‹å?–æ–¹ä½ä¼°è¨ˆçŸ©?™£ï¼ˆæ ¹??šIMU?–®??ƒç?„æ–¹ä½ç¢ºå®šç?„çŸ©?™£A ï¼? ?›¸ä¹˜å?ç?„æ•¸???
+    	pImu->GetData(&ImuData);
+
+        computeMPU6050TCBias();//	è¨ˆç?—æº«åº¦è?œå?Ÿå?å·®??
+
+		//ï¼ˆçŸ©?™£?›¸ä¹˜å?ç?„å? é?Ÿåº¦?•¸???-æº«åº¦è£œå?Ÿå?å·®ï¼?* ï¼?(1/8192) * 9.8065ï¼?
+		//(1/8192) * 9.8065  (8192 LSB = 1 G)
+	 //1G??ç?‹ç??8192?‹æ•¸å­—é?å?†ä??1ï¼Œå?æ?‰é?å?›å? é?Ÿåº¦9.8065m/1G???8192??†ä??1
+        accel500Hz[0] = (ImuData.accel_x - accelTCBias[0]);// * ACCEL_SCALE_FACTOR;
+        accel500Hz[1] = (ImuData.accel_y - accelTCBias[1]);// * ACCEL_SCALE_FACTOR;
+        accel500Hz[2] = -(ImuData.accel_z - accelTCBias[2]);// * ACCEL_SCALE_FACTOR;
+
+    	//?²è?Œæ?æ?‰è?’ç?å?†é?‹ç??
+        accAngle[0]  += atan2f(-accel500Hz[1], -accel500Hz[2]);//Roll = Y & Z
+        accAngle[1] += atan2f(accel500Hz[0], -accel500Hz[2]); // Pitch = X &Z
+
+    	//æ±‚å?–æ?æ?‰è?’ç?—æ•¸å¹³å?‡å??
+        accAngleSmooth[0 ] = accAngle[0 ] / (float)initLoops;
+        accAngleSmooth[1] = accAngle[1] / (float)initLoops;
+
+        osDelay(2);
+    }
+
+	//å¾—åˆ°?›®??æ–¹ä½? ,??å?‹å?–ä?æ¬¡ï?Œä?è?æŒ¯??•é›²?‡ºï¼Œå? ç‚º?™è£¡?ª?”¨äº†å? é?Ÿåº¦?•¸??šè?ˆç?—æ?æ?‰è?’ï?ˆå? é?Ÿåº¦?•¸??šæ˜¯?•·??Ÿå¯ä¿¡ç?„ï?‰ï?Œä?†æ˜¯?? é?Ÿåº¦è¨ˆå??
+	//?Œ¯??•å?ˆæ?æ?Ÿï?Œæ?ä»¥ç‚ºäº†æ?›å?èª¤å·®ï?Œå?å?‹å?–æ–¹ä½ç?„æ?‚å?™ä?è?æŒ¯??•é›²?‡º??
+    evvgcCFAttitude500Hz[0] = accAngleSmooth[0];
+    evvgcCFAttitude500Hz[1 ] = accAngleSmooth[1];
+    evvgcCFAttitude500Hz[2  ] = 0.0f;
+    printf("accAngleSmooth[0]=%f, accAngleSmooth[1]=%f \r\n", accAngleSmooth[0]*57.3, accAngleSmooth[1]*57.3);
+}
+//æ­¤å‡½å¼æ˜¯?–¹ä½ä¼°è¨ˆç?„æ ¸å¿ƒå‡½å¼?
+void getOrientation(float *smoothAcc, float *orient, float *accData, float *gyroData, float dt)
+{
+    float accAngle[3];
+    float gyroRate[3];
+
+	//?šé?ä½¿?”¨atan2f?‡½å¼è?ˆç?—å? é?Ÿåº¦?•¸??šå?—åˆ°æ­æ?‰è?? æ»¾è?‰è?’å?? ä¿¯ä»°è§’ã??
+    accAngle[0] = atan2f(-accData[1], -accData[2]); //Roll = Y & Z
+    accAngle[1] = atan2f(accData[0], -accData[2]); //Pitch = X & Z
+//printf("accAngle[0]=%f, accAngle[1]=%f, ", accAngle[0]*57.3,accAngle[1]*57.3);
+
+	//?…¶ä¸? smoothAcc ?˜¯?šé?å? é?Ÿåº¦?•¸??šç?“é?atan2f?‡½å¼è?ˆç?—å?—ä?†ç?„æ?æ?‰è?’ï?Œä¸¦ä¸”é?²è?Œä?†ä???æ»¯å¾Œæ¿¾æ³?
+	//ï¼ˆæ­¤æ¿¾æ³¢æ¼”ç?—æ?•ä?Ÿå±¬?–¼ä½é?šæ¿¾æ³¢ç?„ä?ç¨®ï?‰ï?Œå„ªé»ï?? å°é?±æ?Ÿæ?§å¹²?“¾?…·??‰è‰¯å¥½ç?„æ?‘åˆ¶ä½œç”¨ ?©?”¨?–¼æ³¢å?•é »??‡è?ƒé?˜ç?„å ´???,
+	// ç¼ºé?ï?? ?›¸ä½æ»¯å¾Œï?Œé?ˆæ?åº¦ä½? æ»¯å?Œç?‹åº¦??–æ±º?–¼a?¼å¤§å°ï?? ä¸èƒ½æ¶ˆé™¤æ¿¾æ³¢? »??‡é?˜æ–¼?¡æ¨?? »??‡ç??1/2??„å¹²?“¾è¨Šè??,ç¨‹å?ç¢¼ä¸­a??„å?¼æ˜¯99.0f
+    smoothAcc[0]  = ((smoothAcc[0 ] * 70.0f) + accAngle[0 ]*30.0f) / 100.0f;
+    smoothAcc[1] = ((smoothAcc[1] *70.0f) + accAngle[1]*30.0f) / 100.0f;
+//printf("smoothAcc[0]=%f, smoothAcc[1]=%f, gyroData[1]=%f ",smoothAcc[0]*57.3, smoothAcc[1]*57.3, gyroData[1]*57.3);
+
+    gyroRate[1] =  gyroData[1];
+	//?šé?ä?’è?œæ¿¾æ³¢ä?†è?å?ˆæ ¹??šå? é?Ÿåº¦??Œé??º??è¨ˆç?—å‡ºä¾†ç?„è?’åº¦ï¼Œorient[PITCH]?˜¯ä¸Šæ¬¡??å?ˆå?ç?„è?’åº¦ï¼ŒgyroRate[PITCH] * dt?˜¯? ¹??šé??º??
+	//?•¸??šè?ˆç?—å?—åˆ°??„è?’åº¦ï¼ˆè?’é?Ÿåº¦*??ç?Œæ?‚é?“ç?æ?œå°±?˜¯å¼§åº¦ï¼Œå¼§åº¦å?Œè?’åº¦å¾ˆå®¹??“ç?„å¯ä»¥ç›¸äº’è?‰æ?›ï?‰ï?Œç‚ºä»?éº¼è?é?²è?Œæ•¸??šè?å?ˆï??
+	//ç­”ï?šå? é?Ÿåº¦è¨ˆå?Œé??º???ƒ½?ƒ½è¨ˆç?—å‡ºå§¿æ?‹ï?Œä?†ç‚ºä½•è?å?å?ƒå?‘è?å?ˆï?Œæ˜¯?? ç‚º?? é?Ÿåº¦è¨ˆå?æŒ¯??•ä?‹é?ç?„æ“¾??•å?ˆæ?æ?Ÿï?Œä?†é•·??Ÿæ•¸??šè?ˆç?—å‡º??„å§¿??‹å¯ä¿¡ï??
+	//?Œé??º????–ç„¶å°æŒ¯??•é?™ä?›ä?æ?æ?Ÿï?Œä?†é•·??Ÿä½¿?”¨???º????ƒå‡º?¾æ¼‚ç§»ï¼Œå? æ­¤??‘å?‘è?é?²è?Œä?’è?œï?ŒçŸ­??Ÿç›¸ä¿¡é??º??ï¼Œé•·??Ÿç›¸ä¿¡å? é?Ÿåº¦è¨?.
+	//??ˆé?šé?å? é?Ÿåº¦è¨ˆå?—åˆ°??„è?’åº¦æ¸›å»ä¸Šä?æ¬¡è?å?ˆå?ç?„è?’åº¦?„¶å¾Œä?˜ä»¥ä¸??‹æ?”ä?‹ä?‚æ•¸ï¼Œé?™å?‹æ?”ä?‹ä?‚æ•¸è¶Šå?ï?Œè?å?ˆç?„å? é?Ÿåº¦è¨ˆç?„æ•¸??šæ?”é?è?Šå?ï??
+	//?Ÿ­??Ÿç›¸ä¿¡é??º??ï¼Œæ?ä»¥é??º????„æ?”é?é?™è£¡?˜¯1ï¼Œé•·??Ÿç›¸ä¿¡å? é?Ÿåº¦è¨ˆï?Œå? é?Ÿåº¦è¨ˆç?„æ•¸??šç”¨ä¾†ä¿®æ­????º????„æ?‚ç§»?”¢??Ÿç?„èª¤å·®ï??
+	//?™æ¨£å°é??º????„æ?‚ç§»?²è?Œä?†ä¿®æ­?ï¼Œæ?‰æ?ˆåœ°??‘åˆ¶äº†å? é?Ÿåº¦è¨ˆå?Œé??º????„è‡ª?–®?¨å·¥ä?œæ?‚å?™ç?„å?å·®.
+//    orient[1]   = (orient[1] + gyroRate[1] * dt) + 0.0002f * (smoothAcc[1] - orient[1]);
+    orient[1]   = (orient[1] + gyroRate[1] * dt) + 0.02f * (smoothAcc[1] - orient[1]);
+
+	//?¯ä»¥ç”¨æ­?å¼¦æ?–é?˜å¼¦??Œxè»¸å–®?¨ç®—å‡ºè§’åº¦,?? ç‚º??‘å?‘çŸ¥??“é?å?›ç?„å¤§å°?
+ //ä½†æ˜¯IMU?–®??ƒå?…é?ˆæ˜¯??œæ­¢æ°´å¹³?????
+    gyroRate[0]  =  gyroData[0] * cosf(fabsf(orient[1])) + gyroData[2] * sinf(orient[1]);
+
+	//?šé?ä?’è?œæ¿¾æ³¢ä?†è?å?ˆæ ¹??šå? é?Ÿåº¦??Œé??º??è¨ˆç?—å‡ºä¾†ç?„è?’åº¦ï¼Œorient[PITCH]?˜¯ä¸Šæ¬¡??å?ˆå?ç?„è?’åº¦ï¼ŒgyroRate[PITCH] * dt?˜¯? ¹??šé??º??
+	//?•¸??šè?ˆç?—å?—åˆ°??„è?’åº¦ï¼ˆè?’é?Ÿåº¦*??ç?Œæ?‚é?“ç?æ?œå°±?˜¯å¼§åº¦ï¼Œå¼§åº¦å?Œè?’åº¦å¾ˆå®¹??“ç?„å¯ä»¥ç›¸äº’è?‰æ?›ï?‰ï?Œç‚ºä»?éº¼è?é?²è?Œæ•¸??šè?å?ˆï??
+	//ç­”ï?šå? é?Ÿåº¦è¨ˆå?Œé??º???ƒ½?ƒ½è¨ˆç?—å‡ºå§¿æ?‹ï?Œä?†ç‚ºä½•è?å?å?ƒå?‘è?å?ˆï?Œæ˜¯?? ç‚º?? é?Ÿåº¦è¨ˆå?æŒ¯??•ä?‹é?ç?„æ“¾??•å?ˆæ?æ?Ÿï?Œä?†é•·??Ÿæ•¸??šè?ˆç?—å‡º??„å§¿??‹å¯ä¿¡ï??
+	//?Œé??º????–ç„¶å°æŒ¯??•é?™ä?›ä?æ?æ?Ÿï?Œä?†é•·??Ÿä½¿?”¨???º????ƒå‡º?¾æ¼‚ç§»ï¼Œå? æ­¤??‘å?‘è?é?²è?Œä?’è?œï?ŒçŸ­??Ÿç›¸ä¿¡é??º??ï¼Œé•·??Ÿç›¸ä¿¡å? é?Ÿåº¦è¨?.
+	//??ˆé?šé?å? é?Ÿåº¦è¨ˆå?—åˆ°??„è?’åº¦æ¸›å»ä¸Šä?æ¬¡è?å?ˆå?ç?„è?’åº¦?„¶å¾Œä?˜ä»¥ä¸??‹æ?”ä?‹ä?‚æ•¸ï¼Œé?™å?‹æ?”ä?‹ä?‚æ•¸è¶Šå?ï?Œè?å?ˆç?„å? é?Ÿåº¦è¨ˆç?„æ•¸??šæ?”é?è?Šå?ï??
+	//?Ÿ­??Ÿç›¸ä¿¡é??º??ï¼Œæ?ä»¥é??º????„æ?”é?é?™è£¡?˜¯1ï¼Œé•·??Ÿç›¸ä¿¡å? é?Ÿåº¦è¨ˆï?Œå? é?Ÿåº¦è¨ˆç?„æ•¸??šç”¨ä¾†ä¿®æ­????º????„æ?‚ç§»?”¢??Ÿç?„èª¤å·®ï??
+	//?™æ¨£å°é??º????„æ?‚ç§»?²è?Œä?†ä¿®æ­?ï¼Œæ?‰æ?ˆåœ°??‘åˆ¶äº†å? é?Ÿåº¦è¨ˆå?Œé??º????„è‡ª?–®?¨å·¥ä?œæ?‚å?™ç?„å?å·®.
+    orient[0]    = (orient[0] + gyroRate[0] * dt) + 0.02f * (smoothAcc[0] - orient[0]);
+
+	//?¯ä»¥ç”¨æ­?å¼¦æ?–é?˜å¼¦??Œxè»¸å–®?¨ç®—å‡ºè§’åº¦,?? ç‚º??‘å?‘çŸ¥??“é?å?›ç?„å¤§å°?
+    //ä½†æ˜¯IMU?–®??ƒå?…é?ˆæ˜¯??œæ­¢æ°´å¹³?????
+    gyroRate[2]   =  gyroData[2] * cosf(fabsf(orient[1])) - gyroData[0] * sinf(orient[1]);
+
+    orient[2]     = (orient[2] + gyroRate[2] * dt);//å°é??º???²è?Œç?å?†å?—åˆ°??èˆªè§’YAW
+    printf("orient[0]=%f, orient[1]=%f, orient[2]=%f, \r\n", orient[0]*57.3, orient[1]*57.3, orient[2]*57.3);
+}
+// Magnetometer define
+
+#if magneto
+
+#define MagnetcDeclination 4.43
+
+int calculateHeading(short x ,short y,short z, short *offsetX, short *offsetY)
+{
+  float headingRadians = atan2((double)((y)-*offsetY),(double)((x)-*offsetX));
+  //ä¿è?‰æ•¸??šåœ¨0-2*PIä¹‹é??
+  if(headingRadians < 0)
+    headingRadians += 2*PI;
+
+  int headingDegrees = headingRadians * 57.3;
+  	  headingDegrees += MagnetcDeclination; //ç£å?è??
+
+  // <span style="font-family: Arial, Helvetica, sans-serif; ??>ä¿è?‰æ•¸??šåœ¨0-360ä¹‹é??</span>
+  if(headingDegrees > 360)
+    headingDegrees -= 360;
+
+  return headingDegrees;
+}
+#endif
+/* USER CODE END FunctionPrototypes */
+
+void StartGimbalTask(void const * argument);
+
+void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
+
+/* GetIdleTaskMemory prototype (linked to static allocation support) */
+void vApplicationGetIdleTaskMemory( StaticTask_t **ppxIdleTaskTCBBuffer, StackType_t **ppxIdleTaskStackBuffer, uint32_t *pulIdleTaskStackSize );
+
+/* USER CODE BEGIN GET_IDLE_TASK_MEMORY */
+static StaticTask_t xIdleTaskTCBBuffer;
+static StackType_t xIdleStack[configMINIMAL_STACK_SIZE];
+
+void vApplicationGetIdleTaskMemory( StaticTask_t **ppxIdleTaskTCBBuffer, StackType_t **ppxIdleTaskStackBuffer, uint32_t *pulIdleTaskStackSize )
+{
+  *ppxIdleTaskTCBBuffer = &xIdleTaskTCBBuffer;
+  *ppxIdleTaskStackBuffer = &xIdleStack[0];
+  *pulIdleTaskStackSize = configMINIMAL_STACK_SIZE;
+  /* place for user code */
+}
+/* USER CODE END GET_IDLE_TASK_MEMORY */
+
+/**
+  * @brief  FreeRTOS initialization
+  * @param  None
+  * @retval None
+  */
+void MX_FREERTOS_Init(void) {
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* definition and creation of GimbalCore */
+  osThreadDef(GimbalCore, StartGimbalTask, osPriorityNormal, 0, 256);
+  GimbalCoreHandle = osThreadCreate(osThread(GimbalCore), NULL);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+}
+
+/* USER CODE BEGIN Header_StartGimbalTask */
+/**
+  * @brief  Function implementing the GimbalCore thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+
+/* USER CODE END Header_StartGimbalTask */
+void StartGimbalTask(void const * argument)
+{
+  /* USER CODE BEGIN StartGimbalTask */
+
+	uint32_t imuOldTick = xTaskGetTickCount();
+	uint8_t id;
+	int16_t mx, my, mz;
+
+	IMU_STRUCT* pImu = GetImuStr_Addr();
+	HMC5883_STRUCT* pHMC5883 = GetHMC5883Str_Addr();
+
+	int result;
+	result = mpu_init();
+	printf("result = %d \r\n", result);
+
+	pImu->Init();
+	pHMC5883->Init();
+
+	orientIMU();
+	MPU6050_Calibration();
+	computeMPU6050RTData();
+
+//  initFirstOrderFilter();
+	initOrientation();
+	computeMPU6050TCBias();
+
+  /* Infinite loop */
+	float yaw=0;
+	short offsetX ,offsetY , offsetZ;
+
+  for(;;)
+  {
+	  if(xTaskGetTickCount() - imuOldTick >= 2)
+	  {
+		  taskENTER_CRITICAL();
+
+		  pImu->GetData(&ImuData);
+		  pHMC5883->GetData(&HMC5883Data);
+
+		  printf("mx=%d, my=%d, mz=%d, \r\n", HMC5883Data.mag_x, HMC5883Data.mag_y, HMC5883Data.mag_z);
+
+		  dt500Hz = (xTaskGetTickCount() - imuOldTick)/configTICK_RATE_HZ;
+
+		  accel500Hz[0] = (ImuData.accel_x - accelTCBias[0]);//*ACCEL_SCALE_FACTOR;
+		  accel500Hz[1] = (ImuData.accel_y - accelTCBias[1]);//;*ACCEL_SCALE_FACTOR;
+		  accel500Hz[2] = -(ImuData.accel_z - accelTCBias[2]);
+		  gyro500Hz[0] = (ImuData.gyro_r - gyroRTBias[0] - gyroTCBias[0]);//*GYRO_SCALE_FACTOR;
+	      gyro500Hz[1] = (ImuData.gyro_p - gyroRTBias[1] - gyroTCBias[1]);//*GYRO_SCALE_FACTOR;
+		  gyro500Hz[2] = -(ImuData.gyro_y - gyroRTBias[2] - gyroTCBias[2]);//*GYRO_SCALE_FACTOR;
+
+			//?›®??æ–¹ä½ä¼°è¨ˆé?‹ç?—ï?Œå…¶ä¸? accAngleSmooth ?˜¯?šé?å? é?Ÿåº¦?•¸??šç?“é?atan2f?‡½å¼è?ˆç?—å?—ä?†ç?„æ?æ?‰è?’ï?Œä¸¦ä¸”é?²è?Œä?†ä???æ»¯å¾Œæ¿¾æ³?
+			//ï¼ˆæ­¤æ¿¾æ³¢æ¼”ç?—æ?•ä?Ÿå±¬?–¼ä½é?šæ¿¾æ³¢ç?„ä?ç¨®ï?‰ï?Œå„ªé»ï?? å°é?±æ?Ÿæ?§å¹²?“¾?…·??‰è‰¯å¥½ç?„æ?‘åˆ¶ä½œç”¨ ?©?”¨?–¼æ³¢å?•é »??‡è?ƒé?˜ç?„å ´???,
+			// ç¼ºé?ï?? ?›¸ä½æ»¯å¾Œï?Œé?ˆæ?åº¦ä½? æ»¯å?Œç?‹åº¦??–æ±º?–¼a?¼å¤§å°? ä¸èƒ½æ¶ˆé™¤æ¿¾æ³¢? »??‡é?˜æ–¼?¡æ¨?? »??‡ç??1/2??„å¹²?“¾è¨Šè??,
+			//getOrientation?‡½å¼å…§?ƒ¨ä½¿ç”¨äº†accAngleSmoothæ­æ?‰è?’è?‡é??º???•¸??šé?²è?Œä?†ä?’è?œæ¿¾æ³¢è?å?ˆæ?”ç?—æ?•å?—åˆ°ç©©å?šç?„æ?æ?‰è?’ï?Œä¸¦ä¸?
+			//å­˜æ”¾?ˆ°sensors.evvgcCFAttitude500Hzè£¡é¢ï¼Œsensors.accel500Hz??Œsensors.gyro500Hz?˜¯ç¶“é?ä?Šé¢æ¼”ç?—æ?•è?•ç?†å?ç?„å? é?Ÿåº¦?•¸???
+			//??Œé??º???•¸??šï?Œdt500Hz?˜¯??‚é?“å?é?ï?Œä?Ÿå°±?˜¯?Ÿ·è¡Œif (frame_500Hz){} è£¡é¢??„ç?‹å?ç¢¼??“é??
+		  getOrientation(accAngleSmooth, evvgcCFAttitude500Hz, accel500Hz, gyro500Hz, dt500Hz);
+
+/*		  printf("Roll=%f, Pitch=%f, Yaw=%f \r\n",gyro500Hz[0], gyro500Hz[1], gyro500Hz[2]);
+		  accel500Hz[0] = firstOrderFilter(accel500Hz[0], &firstOrderFilters[ACCEL_X_500HZ_LOWPASS]);
+		  accel500Hz[1] = firstOrderFilter(accel500Hz[1], &firstOrderFilters[ACCEL_Y_500HZ_LOWPASS]);
+		  accel500Hz[2] = firstOrderFilter(accel500Hz[2], &firstOrderFilters[ACCEL_Z_500HZ_LOWPASS]);
+*/
+		  //?ˆªå§¿å?ƒè?ƒç³»çµ±æ›´?–°ï¼Œå…¥?£??ƒæ•¸?˜¯ä¸‰è»¸???º???•¸??šï?Œä?‰è»¸?? é?Ÿåº¦?•¸??šï?Œä?‰è»¸ç£å?›è?ˆæ•¸???,ä»¥å?Šæ?‡ç¤º?˜¯?¦?›´?–°ç£å?›è?ˆæ•¸??šç?„magDataUpdate??ƒæ•¸ï¼?
+		  //magDataUpdate=falseè¡¨ç¤ºä¸æ›´?–°ç£å?›è?ˆæ•¸??šï??
+		  //magDataUpdate=trueè¡¨ç¤º?›´?–°ç£å?›è?ˆæ•¸??šï??
+		  //??å¾Œä??‹å?ƒæ•¸?˜¯??‚é?“å?é?Dtï¼Œä?Ÿå°±?˜¯æ­¤å‡½å¼æœ¬
+		  //æ¬¡åŸ·è¡Œè?‡ä?Šæ¬¡?Ÿ·è¡Œç?„æ?‚é?“é?“é?”ã??
+		  MargAHRSupdate(gyro500Hz[0], gyro500Hz[1], gyro500Hz[2], accel500Hz[0], accel500Hz[1], accel500Hz[2],HMC5883Data.mag_x, HMC5883Data.mag_y, HMC5883Data.mag_z, true, dt500Hz);
+
+//		  float pitch = atan2(accel500Hz[1], sqrt(accel500Hz[0] * accel500Hz[0] + accel500Hz[2] * accel500Hz[2])) * 180.0 / PI;
+//		  float roll = atan2(-accel500Hz[0], accel500Hz[2]) * 180.0 / PI;
+//		  yaw +=  gyro500Hz[2] * dt500Hz;
+//		  printf("p=%f, r=%f, y=%f, \r\n", pitch, roll,yaw);
+
+		  //test quarant
+//		  Angle_Update(gyro500Hz[0],gyro500Hz[1],gyro500Hz[2],accel500Hz[0],accel500Hz[1],accel500Hz[2]);
+//		  Angle_Update(ImuData.gyro_r,ImuData.gyro_p,ImuData.gyro_y,ImuData.accel_x,ImuData.accel_y,ImuData.accel_z);
+
+/*		    float accAngle_cal_0 = atan2f(-accel500Hz[1], -accel500Hz[2]); //Roll = Y & Z
+		    float accAngle_cal_1 = atan2f(accel500Hz[0], -accel500Hz[2]); //Pitch = X & Z
+		    printf("accAngle_cal_Roll=%f, accAngle_cal_Pitch=%f, ", accAngle_cal_0 * 57.3, accAngle_cal_1 * 57.3);
+
+		    float accAngle_uncal_0 = atan2f(-ImuData.accel_y, ImuData.accel_z); //Roll = Y & Z
+		    float accAngle_uncal_1 = atan2f(ImuData.accel_x, ImuData.accel_z); //Pitch = X & Z
+		    printf("accAngle_uncal_Roll=%f, accAngle_uncal_Pitch=%f, \r\n", accAngle_uncal_0*57.3, accAngle_uncal_1*57.3);
+*/
+		  imuOldTick = xTaskGetTickCount();
+		  taskEXIT_CRITICAL();
+	  }
+
+	//osDelay(2);
+  }
+  /* USER CODE END StartGimbalTask */
+}
+
+/* Private application code --------------------------------------------------*/
+/* USER CODE BEGIN Application */
+
+/* USER CODE END Application */
